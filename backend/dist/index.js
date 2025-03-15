@@ -327,5 +327,5 @@ app.post('/game/reset', (req, res) => {
         turn: chess.turn()
     });
 });
-const PORT = 4000;
+const PORT = 4040;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
