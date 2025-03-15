@@ -442,7 +442,7 @@ export default function Game(): ReactElement {
       
       // Send move to server and get AI response
       const response = await axios.post<AiMoveResponse>(
-        "http://localhost:4000/game/move", 
+        "https://chess-backend.deekshithreddy.site/game/move", 
         {
           fen: chessRef.current.fen(),
           move: `${from}${to}`,
@@ -593,7 +593,7 @@ export default function Game(): ReactElement {
       setIsLoading(true);
       chessRef.current.reset();
       
-      const response = await axios.post("http://localhost:4000/game/reset");
+      const response = await axios.post("https://chess-backend.deekshithreddy.site/game/reset");
       
       setGameOver(false);
       setGameStatus("");
