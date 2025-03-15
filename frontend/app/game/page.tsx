@@ -535,7 +535,7 @@ import MoveHistory from './MoveHistory';
 import GameControls from './GameControls';
 
 // API base URL - adjust based on your backend
-const API_BASE_URL = "https://chess-backend.deekshithreddy.site.com";
+const API_BASE_URL = "https://chess-backend.deekshithreddy.site";
 
 export default function Game() {
   // Chess.js game state
