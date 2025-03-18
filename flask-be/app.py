@@ -1,23 +1,33 @@
 from flask import Flask, request, jsonify, send_file
+from flask_socketio import SocketIO, emit, join_room
 from flask_cors import CORS
 import chess
 import uuid
 import time
-from concurrent.futures import ProcessPoolExecutor
 import io
 from PIL import Image, ImageDraw, ImageFont
 import os
 import threading
+import eventlet
+
+# Use eventlet for WebSocket support
+eventlet.monkey_patch()
 
 app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 CORS(app)
+
 
 # Store chess games by session ID
 game_instances = {}
 # Track last activity time for each game
 last_activity = {}
 # Game expiration time (30 minutes)
-EXPIRATION_TIME = 30 * 60
+EXPIRATION_TIME = 15 * 60
+# Track possibilities 
+game_possibilities = {}
+# Track active computations
+active_computations = {}
 
 # Piece values for evaluation
 PIECE_VALUES = {
@@ -52,6 +62,8 @@ def cleanup_expired_games():
         for game_id in expired_games:
             if game_id in game_instances:
                 del game_instances[game_id]
+            if game_id in game_possibilities:
+                del game_possibilities[game_id]
             if game_id in last_activity:
                 del last_activity[game_id]
             print(f"Expired game session {game_id} removed")
@@ -94,55 +106,119 @@ def evaluate_board(board):
     
     return value
 
-def minimax(board, depth, alpha, beta, maximizing_player, possibilities):
+def minimax(board, depth, alpha, beta, maximizing_player, game_id):
     """Minimax algorithm with alpha-beta pruning"""
-    possibilities += 1
-    
     if depth == 0 or board.is_game_over():
-        return evaluate_board(board), possibilities
+        return evaluate_board(board)
     
     if maximizing_player:  # Black's turn (AI)
         max_eval = float('-inf')
         for move in board.legal_moves:
+            if active_computations[game_id] == False:
+                break
             board.push(move)
-            evaluation, new_possibilities = minimax(board, depth - 1, alpha, beta, False, possibilities)
-            possibilities = new_possibilities
+            game_possibilities[game_id] += 1
+            # Send progress update every 1000 positions analyzed
+            if game_possibilities[game_id] % 1000 == 0:
+                socketio.emit('search_progress', {
+                    'positions_analyzed': game_possibilities[game_id],
+                    'depth': depth
+                }, room=game_id)
+                # Allow eventlet to switch to other tasks
+                eventlet.sleep(0)
+            
+            evaluation = minimax(board, depth - 1, alpha, beta, False, game_id)
             board.pop()
             max_eval = max(max_eval, evaluation)
             alpha = max(alpha, evaluation)
             if beta <= alpha:
                 break  # Beta cutoff
-        return max_eval, possibilities
+        return max_eval
     else:  # White's turn (Human)
         min_eval = float('inf')
         for move in board.legal_moves:
             board.push(move)
-            evaluation, new_possibilities = minimax(board, depth - 1, alpha, beta, True, possibilities)
-            possibilities = new_possibilities
+            game_possibilities[game_id] += 1
+            # Send progress update every 1000 positions analyzed
+            if game_possibilities[game_id] % 1000 == 0:
+                socketio.emit('search_progress', {
+                    'positions_analyzed': game_possibilities[game_id],
+                    'depth': depth
+                }, room=game_id)
+                # Allow eventlet to switch to other tasks
+                eventlet.sleep(0)
+                
+            evaluation = minimax(board, depth - 1, alpha, beta, True, game_id)
             board.pop()
             min_eval = min(min_eval, evaluation)
             beta = min(beta, evaluation)
             if beta <= alpha:
                 break  # Alpha cutoff
-        return min_eval, possibilities
+        return min_eval
 
-def find_best_move(board, depth=3, possibilities=0):
-    """Find the best move for the current position"""
-    best_move = None
-    best_value = float('-inf')
-    possibilities += 1
-    
-    for move in board.legal_moves:
-        board.push(move)
-        move_value, new_possibilities  = minimax(board, depth - 1, float('-inf'), float('inf'), False, possibilities)
-        possibilities = new_possibilities
-        board.pop()
+def compute_ai_move(board, depth, game_id):
+    """Find the best move for the current position and emit result via WebSocket"""
+    try:
+        active_computations[game_id] = True
+        game_possibilities[game_id] = 0
+        best_move = None
+        best_value = float('-inf')
         
-        if move_value > best_value:
-            best_value = move_value
-            best_move = move
-    
-    return best_move, possibilities
+        # Emit start of computation
+        socketio.emit('ai_thinking', {
+            'message': f'AI is thinking at depth {depth}...',
+            'depth': depth
+        }, room=game_id)
+        
+        for move in board.legal_moves:
+            board.push(move)
+            game_possibilities[game_id] += 1
+            move_value = minimax(board, depth - 1, float('-inf'), float('inf'), False, game_id)
+            board.pop()
+            
+            if move_value > best_value:
+                best_value = move_value
+                best_move = move
+        
+        if best_move:
+            # Convert move to string format
+            ai_move_uci = best_move.uci()
+            ai_move_san = board.san(best_move)
+            
+            # Make the AI move
+            board.push(best_move)
+            
+            # Generate response data
+            response_data = {
+                'fen': board.fen(),
+                'gameOver': board.is_game_over(),
+                'checkmate': board.is_checkmate(),
+                'stalemate': board.is_stalemate(),
+                'draw': board.is_insufficient_material() or board.is_stalemate() 
+                       or board.is_fifty_moves() or board.is_repetition(),
+                'inCheck': board.is_check(),
+                'turn': 'white',  # Now it's player's turn again
+                'aiMove': {
+                    'uci': ai_move_uci,
+                    'san': ai_move_san
+                },
+                'possibilities': game_possibilities[game_id]
+            }
+            
+            # Emit the result
+            socketio.emit('ai_move_result', response_data, room=game_id)
+        else:
+            socketio.emit('ai_move_error', {
+                'error': 'AI could not find a valid move'
+            }, room=game_id)
+            
+    except Exception as e:
+        socketio.emit('ai_move_error', {
+            'error': f'Error computing move: {str(e)}'
+        }, room=game_id)
+    finally:
+        if game_id in active_computations:
+            del active_computations[game_id]
 
 def generate_board_image(board):
     """Generate a chess board image from the current position"""
@@ -163,7 +239,7 @@ def generate_board_image(board):
     
     # Try to load a font for the chess pieces
     try:
-        font = ImageFont.truetype("arial.ttf", 36)
+        font = ImageFont.truetype("DejaVuSans.ttf", 36)  # DejaVu Sans has chess symbols
     except IOError:
         font = ImageFont.load_default()
     
@@ -185,98 +261,7 @@ def generate_board_image(board):
     img_byte_array.seek(0)
     return img_byte_array
 
-@app.route('/game/create', methods=['POST'])
-def create_game():
-    """Create a new game session"""
-    game_id = str(uuid.uuid4())
-    game_instances[game_id] = chess.Board()
-    last_activity[game_id] = time.time()
-    
-    return jsonify({
-        'game_id': game_id,
-        'fen': game_instances[game_id].fen(),
-        'turn': 'white',
-        'message': 'New game created'
-    })
-
-@app.route('/game/move', methods=['POST'])
-def make_move():
-    """Process a player's move and respond with AI move"""
-    data = request.json
-    game_id = data.get('game_id')
-    print(game_id)
-    
-    # Validate game_id
-    if not game_id or game_id not in game_instances:
-        return jsonify({'error': 'Invalid or expired game session'}), 400
-    
-    # Update last activity time
-    last_activity[game_id] = time.time()
-    board = game_instances[game_id]
-    
-    # Check if it's player's turn (white)
-    if board.turn != chess.WHITE:
-        return jsonify({'error': 'Not your turn, AI is thinking'}), 400
-    
-    # Process player's move
-    try:
-        move = chess.Move.from_uci(data['move'])
-        if move not in board.legal_moves:
-            return jsonify({'error': 'Illegal move'}), 400
-        
-        board.push(move)
-    except (KeyError, ValueError) as e:
-        return jsonify({'error': f'Invalid move format: {str(e)}'}), 400
-    
-    # Check if game is over after player's move
-    if board.is_game_over():
-        return jsonify({
-            'fen': board.fen(),
-            'gameOver': True,
-            'checkmate': board.is_checkmate(),
-            'stalemate': board.is_stalemate(),
-            'draw': board.is_insufficient_material() or board.is_stalemate() 
-                   or board.is_fifty_moves() or board.is_repetition(),
-            'inCheck': board.is_check(),
-            'turn': 'black',
-            'playerMove': data['move'],
-        })
-    
-    # Calculate AI's move
-    depth = data.get('depth', 2)
-    best_move, possibilities = find_best_move(board, depth, 0)
-    
-    if best_move:
-        # Convert move to string format
-        ai_move_uci = best_move.uci()
-        ai_move_san = board.san(best_move)
-        
-        # Make the AI move
-        board.push(best_move)
-        
-        # Generate response data
-        response_data = {
-            'fen': board.fen(),
-            'gameOver': board.is_game_over(),
-            'checkmate': board.is_checkmate(),
-            'stalemate': board.is_stalemate(),
-            'draw': board.is_insufficient_material() or board.is_stalemate() 
-                   or board.is_fifty_moves() or board.is_repetition(),
-            'inCheck': board.is_check(),
-            'turn': 'white',  # Now it's player's turn again
-            'playerMove': data['move'],
-            'aiMove': {
-                'uci': ai_move_uci,
-                'san': ai_move_san
-            },
-            'possibilities': possibilities
-        }
-        
-        return jsonify(response_data)
-    else:
-        return jsonify({'error': 'AI could not find a valid move'}), 500
-
-@app.route('/game/board/<game_id>', methods=['GET'])
+@app.route('/board/<game_id>', methods=['GET'])
 def get_board_image(game_id):
     """Get the current board state as an image"""
     if game_id not in game_instances:
@@ -287,16 +272,197 @@ def get_board_image(game_id):
     
     return send_file(img_bytes, mimetype='image/png')
 
-@app.route('/game/status/<game_id>', methods=['GET'])
-def get_game_status(game_id):
-    """Get the current game status"""
-    if game_id not in game_instances:
-        return jsonify({'error': 'Invalid or expired game session'}), 400
+@socketio.on('connect')
+def handle_connect():
+    """Handle client connection"""
+    print(f"Client connected: {request.sid}")
+    emit('connected', {'status': 'connected'})
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Handle client disconnection"""
+    print(f"Client disconnected: {request.sid}")
+
+@socketio.on('create_game')
+def handle_create_game():
+    """Create a new game session"""
+    game_id = str(uuid.uuid4())
+    game_instances[game_id] = chess.Board()
+    game_possibilities[game_id] = 0
+    last_activity[game_id] = time.time()
+    
+    # Join the client to a room with the game_id
+    join_room(game_id)
+    
+    emit('game_created', {
+        'game_id': game_id,
+        'fen': game_instances[game_id].fen(),
+        'turn': 'white',
+        'message': 'New game created'
+    })
+
+@socketio.on('join_game')
+def handle_join_game(data):
+    """Join an existing game session"""
+    game_id = data.get('game_id')
+    
+    if not game_id or game_id not in game_instances:
+        emit('game_error', {'error': 'Invalid or expired game session'})
+        return
+    
+    # Join the client to a room with the game_id
+    join_room(game_id)
+    
+    # Update last activity time
+    last_activity[game_id] = time.time()
+    board = game_instances[game_id]
+    
+    emit('game_joined', {
+        'game_id': game_id,
+        'fen': board.fen(),
+        'turn': 'white' if board.turn == chess.WHITE else 'black',
+        'gameOver': board.is_game_over(),
+        'message': 'Joined existing game'
+    })
+
+@socketio.on('make_move')
+def handle_make_move(data):
+    """Process a player's move"""
+    game_id = data.get('game_id')
+    move_uci = data.get('move')
+    from_move = data.get('from')
+    to_move = data.get('to')
+    promotion = data.get('promotion')
+    depth = int(data.get('depth', 3))
+    
+    # Validate game_id
+    if not game_id or game_id not in game_instances:
+        emit('game_error', {'error': 'Invalid or expired game session'})
+        return
+    
+    # Update last activity time
+    last_activity[game_id] = time.time()
+    board = game_instances[game_id]
+    
+    # Check if it's player's turn (white)
+    if board.turn != chess.WHITE:
+        emit('game_error', {'error': 'Not your turn, AI is thinking'})
+        return
+    
+    # Check if computation already in progress
+    if game_id in active_computations and active_computations[game_id]:
+        emit('game_error', {'error': 'AI is already computing a move'})
+        return
+    
+    # Process player's move
+    try:
+
+        from_square = chess.parse_square(from_move)
+        to_square = chess.parse_square(to_move)
+        
+        # Detect if this is a pawn promotion move
+        is_promotion_move = False
+        piece = board.piece_at(from_square)
+        
+        # Check if it's a pawn moving to the last rank
+        if piece and piece.piece_type == chess.PAWN:
+            if (piece.color == chess.WHITE and chess.square_rank(to_square) == 7) or \
+               (piece.color == chess.BLACK and chess.square_rank(to_square) == 0):
+                is_promotion_move = True
+        
+        # Set promotion piece - default to queen if not specified but needed
+        promotion_piece = None
+        if is_promotion_move:
+            if promotion:
+                promotion_map = {'q': chess.QUEEN, 'r': chess.ROOK, 'b': chess.BISHOP, 'n': chess.KNIGHT}
+                promotion_piece = promotion_map.get(promotion.lower(), chess.QUEEN)
+            else:
+                # Default to queen if promotion is required but not specified
+                promotion_piece = chess.QUEEN
+        
+        # Create the move
+        move = chess.Move(from_square=from_square, to_square=to_square, promotion=promotion_piece)
+        
+        if move not in board.legal_moves:
+            # Try to find a legal move with the same from/to squares but different promotion
+            legal_move_found = False
+            for legal_move in board.legal_moves:
+                if legal_move.from_square == from_square and legal_move.to_square == to_square:
+                    move = legal_move  # Use this legal move instead
+                    legal_move_found = True
+                    break
+            
+            if not legal_move_found:
+                emit('game_error', {'error': 'Illegal move'})
+                return
+        
+        board.push(move)
+        
+        # Emit move acknowledgment
+        emit('move_accepted', {
+            'fen': board.fen(),
+            'playerMove': move_uci,
+        })
+        
+        # Check if game is over after player's move
+        if board.is_game_over():
+            emit('game_over', {
+                'fen': board.fen(),
+                'gameOver': True,
+                'checkmate': board.is_checkmate(),
+                'stalemate': board.is_stalemate(),
+                'draw': board.is_insufficient_material() or board.is_stalemate() 
+                       or board.is_fifty_moves() or board.is_repetition(),
+                'inCheck': board.is_check(),
+                'turn': 'black',
+                'playerMove': move_uci,
+            })
+            return
+        
+        # Start AI computation in a separate thread
+        ai_thread = threading.Thread(
+            target=compute_ai_move,
+            args=(board, depth, game_id)
+        )
+        ai_thread.daemon = True
+        ai_thread.start()
+        
+    except (KeyError, ValueError) as e:
+        emit('game_error', {'error': f'Invalid move format: {str(e)}'})
+
+@socketio.on('reset_game')
+def handle_reset_game(data):
+    """Reset the game to initial position"""
+    game_id = data.get('game_id')
+    
+    if not game_id or game_id not in game_instances:
+        emit('game_error', {'error': 'Invalid or expired game session'})
+        return
+    
+    game_instances[game_id].reset()
+    game_possibilities[game_id] = 0
+    last_activity[game_id] = time.time()
+    
+    emit('game_reset', {
+        'game_id': game_id,
+        'fen': game_instances[game_id].fen(),
+        'turn': 'white',
+        'message': 'Game reset successfully'
+    }, room=game_id)
+
+@socketio.on('get_game_status')
+def handle_get_game_status(data):
+    """Get current game status"""
+    game_id = data.get('game_id')
+    
+    if not game_id or game_id not in game_instances:
+        emit('game_error', {'error': 'Invalid or expired game session'})
+        return
     
     board = game_instances[game_id]
-    last_activity[game_id] = time.time()  # Update last activity time
+    last_activity[game_id] = time.time()
     
-    return jsonify({
+    emit('game_status', {
         'fen': board.fen(),
         'gameOver': board.is_game_over(),
         'checkmate': board.is_checkmate(),
@@ -311,20 +477,21 @@ def get_game_status(game_id):
         }
     })
 
-@app.route('/game/reset/<game_id>', methods=['POST'])
-def reset_game(game_id):
-    """Reset the game to initial position"""
-    if game_id not in game_instances:
-        return jsonify({'error': 'Invalid or expired game session'}), 400
+@socketio.on('cancel_calculation')
+def handle_cancel_calculation(data):
+    """Cancel an ongoing AI calculation"""
+    game_id = data.get('game_id')
     
-    game_instances[game_id].reset()
-    last_activity[game_id] = time.time()
+    if not game_id or game_id not in game_instances:
+        emit('game_error', {'error': 'Invalid or expired game session'})
+        return
     
-    return jsonify({
-        'fen': game_instances[game_id].fen(),
-        'turn': 'white',
-        'message': 'Game reset successfully'
-    })
+    if game_id in active_computations:
+        # Mark computation as canceled
+        active_computations[game_id] = False
+        emit('calculation_canceled', {
+            'message': 'AI calculation canceled'
+        }, room=game_id)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=4040, threaded=True)
+    socketio.run(app, host='0.0.0.0', port=4040, debug=True)

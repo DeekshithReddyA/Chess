@@ -33,3 +33,44 @@ export interface GameResponse {
   error?: string;
   possibilities?: string;
 }
+
+
+
+// Socket.IO event types
+export interface GameCreatedEvent {
+  game_id: string;
+  fen: string;
+  turn: string;
+  message: string;
+}
+
+export interface MoveAcceptedEvent {
+  fen: string;
+  playerMove: string;
+}
+
+export interface AIThinkingEvent {
+  message: string;
+  depth: number;
+}
+
+export interface SearchProgressEvent {
+  positions_analyzed: number;
+  depth: number;
+}
+
+export interface AIMoveResultEvent {
+  fen: string;
+  gameOver: boolean;
+  checkmate: boolean;
+  stalemate: boolean;
+  draw: boolean;
+  inCheck: boolean;
+  turn: string;
+  aiMove: AIMove;
+  possibilities: number;
+}
+
+export interface GameErrorEvent {
+  error: string;
+}
